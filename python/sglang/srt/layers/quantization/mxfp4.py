@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    is_xpu,
     mxfp_supported,
     next_power_of_2,
     round_up,
@@ -145,6 +146,7 @@ if TYPE_CHECKING:
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -858,6 +860,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
+        elif _is_xpu:
+            # Intel XPU (BMG/Xe2): keep the MXFP4 weights packed and run the
+            # tile-fused grouped GEMM (sgl_kernel fused_experts use_mxfp4_w4a16)
+            # in apply(). No bf16 upcast — the kernel dequantizes B per-tile in
+            # registers. Convert the on-disk tensors to the kernel's ABI:
+            #   - weights: uint8 [E, N, K/2] reinterpreted as int8 (raw E2M1
+            #     nibble pairs; the kernel reads them as cutlass::float_e2m1_t).
+            #   - scales: E8M0 byte -> fp32 direct multiplier exp2(s - 127),
+            #     same [E, N, K/32] N-outer layout the kernel expects.
+            #   - biases: fp32 [E, N], left in HF's interleaved gate/up order
+            #     (even=gate, odd=up), which the SWIGLU_GPT_OSS epilogue reads
+            #     directly via its Stride<2> bias tensors.
+            layer.w13_weight = Parameter(
+                layer.w13_weight.data.view(torch.int8), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                layer.w2_weight.data.view(torch.int8), requires_grad=False
+            )
+            layer.w13_weight_scale = Parameter(
+                torch.exp2(
+                    (layer.w13_weight_scale.data.to(torch.int32) - 127).to(
+                        torch.float32
+                    )
+                ).contiguous(),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale = Parameter(
+                torch.exp2(
+                    (layer.w2_weight_scale.data.to(torch.int32) - 127).to(
+                        torch.float32
+                    )
+                ).contiguous(),
+                requires_grad=False,
+            )
+            if hasattr(layer, "w13_weight_bias"):
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.data.to(torch.float32), requires_grad=False
+                )
+            if hasattr(layer, "w2_weight_bias"):
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.data.to(torch.float32), requires_grad=False
+                )
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -1110,6 +1155,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_runner_config.gemm1_alpha,
                 layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        if _is_xpu:
+            # Intel XPU (BMG/Xe2): tile-fused MXFP4 W4A16 grouped GEMM. Weights
+            # stay packed int8 [E, N, K/2]; scales are fp32 [E, N, K/32]; biases
+            # fp32 [E, N] in interleaved gate/up order (see
+            # process_weights_after_loading). gpt-oss carries the swiglu
+            # alpha/clamp on the runner config; passing gemm1_alpha selects the
+            # in-kernel SWIGLU_GPT_OSS epilogue (activation_type=2).
+            from sgl_kernel import fused_experts as xpu_fused_experts
+
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            topk_weights, topk_ids, _ = topk_output
+            output = xpu_fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights.to(torch.bfloat16),
+                topk_ids,
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                inplace=False,
+                activation="silu",
+                use_mxfp4_w4a16=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                gemm1_alpha=layer.moe_runner_config.gemm1_alpha,
+                gemm1_limit=layer.moe_runner_config.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=output)
 

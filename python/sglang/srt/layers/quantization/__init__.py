@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     is_npu,
+    is_xpu,
     mxfp_supported,
 )
 
@@ -100,7 +101,9 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or is_xpu() or (_is_mxfp_supported and is_hip()):
+    # XPU: mxfp4 W4A16 MoE runs via sgl-kernel-xpu's
+    # moe_grouped_mm_nt_xe20_mxfp4_w4a16 (BMG/Xe2 tile-fused grouped GEMM).
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
