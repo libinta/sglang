@@ -352,10 +352,19 @@ class LMCRadixCache(RadixCache):
         chunk_size = self.lmcache_connector.chunk_size()
         prefix_pad = value_numel % chunk_size
 
-        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(EvictParams(num_tokens=uncached_len))
+        # Protect last_node (and its ancestors) across eviction: evict() frees
+        # evictable leaves and walks up parents whose lock_ref == 0, so without
+        # this lock the very node we are about to attach the loaded KV under can
+        # be deleted mid-traversal, corrupting the radix tree (later surfaces as
+        # "parent does not have child key" in _delete_leaf).
+        self.inc_lock_ref(last_node)
+        try:
+            if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+                self.evict(EvictParams(num_tokens=uncached_len))
 
-        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+            token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        finally:
+            self.dec_lock_ref(last_node)
         if token_slots is None:
             return None
 
