@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -184,7 +186,34 @@ class LMCRadixCache(RadixCache):
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
 
+        # Async store (IP mode only). The synchronous IP store_kv runs the full
+        # per-layer D2H generator on the scheduler thread at request completion
+        # (0.3-2.2s under load), parking decode + admission and starving the
+        # running batch -> the tp1 livelock. Mirror vLLM's save_kv_layer /
+        # wait_for_save split: submit the store to a background worker and only
+        # block on outstanding stores when the pool is actually under pressure
+        # (in evict()). The node stays lock_ref'd until its store lands, so its
+        # KV slots are never reused early. Gate with SGLANG_LMC_ASYNC_STORE
+        # (default on) for clean A/B.
+        self._async_store = (
+            self._mode is LMCacheMode.IP
+            and os.environ.get("SGLANG_LMC_ASYNC_STORE", "1") == "1"
+        )
+        # Single worker: stores must stay ordered wrt each other and there is
+        # one store_stream; concurrency would only contend on it.
+        self._store_executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="lmc-store")
+            if self._async_store
+            else None
+        )
+        # Pending store futures, each paired with the node to unlock once done.
+        self._pending_stores: list[Tuple[Future, TreeNode]] = []
+
     def reset(self):
+        # Drain any in-flight async stores before tearing down the tree so we
+        # don't race a background store against the reset.
+        if getattr(self, "_async_store", False):
+            self._drain_pending_stores()
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
@@ -508,22 +537,85 @@ class LMCRadixCache(RadixCache):
             self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
         elif self._mode is LMCacheMode.IP:
-            with _device_stream_context(self.store_stream):
-                self.lmcache_connector.store_kv(store_md)
-            # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
+            if self._async_store:
+                # Submit the per-layer store to the background worker so the
+                # scheduler thread returns immediately (no D2H stall on the hot
+                # path). new_last_node stays lock_ref'd until the store lands;
+                # the unlock happens in _reap_pending_stores (called from
+                # evict() / wait). This is the fix for the synchronous-store
+                # scheduler starvation behind the tp1 livelock.
+                future = self._store_executor.submit(
+                    self._run_store, store_md
+                )
+                with self._node_lock:
+                    self._pending_stores.append((future, new_last_node))
+                # Cheap, non-blocking: release nodes whose store already
+                # finished so locks don't accumulate between evictions.
+                self._reap_pending_stores(block=False)
+            else:
+                with _device_stream_context(self.store_stream):
+                    self.lmcache_connector.store_kv(store_md)
+                # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
+                with self._node_lock:
+                    self._in_flight_nodes.append(new_last_node)
+
+    def _run_store(self, store_md) -> None:
+        """Background-worker body: run the per-layer IP store and make the
+        device reads observably complete before the future resolves, so the
+        node can be safely unlocked/evicted afterwards.
+        """
+        with _device_stream_context(self.store_stream):
+            self.lmcache_connector.store_kv(store_md)
+        # Ensure the store_stream D2H reads are done before this future is
+        # considered complete (mirrors the sync path's evict-time sync).
+        self.store_stream.synchronize()
+
+    def _reap_pending_stores(self, block: bool) -> None:
+        """Unlock nodes whose async store has finished. If ``block`` is True,
+        wait for all pending stores (used under pool pressure / teardown);
+        otherwise only reap the ones already done (hot-path friendly).
+        """
+        if not self._async_store:
+            return
+        with self._node_lock:
+            pending = self._pending_stores
+            self._pending_stores = []
+        still_pending = []
+        for future, node in pending:
+            if block or future.done():
+                try:
+                    future.result()
+                except Exception as e:  # pragma: no cover - log and continue
+                    logger.error("async store failed: %s", e, exc_info=True)
+                self.dec_lock_ref(node)
+            else:
+                still_pending.append((future, node))
+        if still_pending:
             with self._node_lock:
-                self._in_flight_nodes.append(new_last_node)
+                # Prepend so ordering (oldest first) is preserved.
+                self._pending_stores = still_pending + self._pending_stores
+
+    def _drain_pending_stores(self) -> None:
+        """Block until every outstanding async store has landed."""
+        self._reap_pending_stores(block=True)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
         if self.disable:
             return EvictResult()
 
-        self.store_stream.synchronize()
-        with self._node_lock:
-            for node in self._in_flight_nodes:
-                self.dec_lock_ref(node)
-            self._in_flight_nodes.clear()
+        if self._async_store:
+            # Under pool pressure we need locked-by-store nodes to become
+            # evictable, so block-drain pending stores here (NOT on the
+            # completion hot path). This is the only place async store pays
+            # its sync cost, and only when memory is actually tight.
+            self._drain_pending_stores()
+        else:
+            self.store_stream.synchronize()
+            with self._node_lock:
+                for node in self._in_flight_nodes:
+                    self.dec_lock_ref(node)
+                self._in_flight_nodes.clear()
 
         return super().evict(params)
 
