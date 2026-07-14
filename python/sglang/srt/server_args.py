@@ -3903,6 +3903,7 @@ class ServerArgs:
                     and is_triton_kernels_available()
                     and self.quantization is None
                     and not (is_cpu() and cpu_has_amx_support())
+                    and not is_xpu()
                 ):
                     # The triton_kernels package segfaults on Blackwell (B200)
                     # with NVIDIA driver >= 595. Fall back to triton backend.

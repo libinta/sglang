@@ -331,7 +331,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        # On Intel XPU, MXFP4 MoE always runs the dedicated _is_xpu path in
+        # apply()/process_weights_after_loading (packed W4A16 tile-fused GEMM).
+        # The triton_kernels branch would del layer.w13_weight during weight
+        # processing, which the XPU apply() path still needs -> AttributeError.
+        # Keep the two paths consistent by disabling triton kernels on XPU.
+        self.use_triton_kernels = (
+            get_moe_runner_backend().is_triton_kernels() and not _is_xpu
+        )
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
